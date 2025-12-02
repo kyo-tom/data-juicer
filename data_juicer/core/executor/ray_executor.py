@@ -82,16 +82,16 @@ class RayExecutor(ExecutorBase):
             # The RayExporter will handle falling back to environment variables or other credential mechanisms.
             if hasattr(self.cfg, "export_aws_credentials") and self.cfg.export_aws_credentials:
                 export_aws_creds = self.cfg.export_aws_credentials
-                if hasattr(export_aws_creds, "aws_access_key_id"):
-                    export_extra_args["aws_access_key_id"] = export_aws_creds.aws_access_key_id
-                if hasattr(export_aws_creds, "aws_secret_access_key"):
-                    export_extra_args["aws_secret_access_key"] = export_aws_creds.aws_secret_access_key
-                if hasattr(export_aws_creds, "aws_session_token"):
-                    export_extra_args["aws_session_token"] = export_aws_creds.aws_session_token
-                if hasattr(export_aws_creds, "aws_region"):
-                    export_extra_args["aws_region"] = export_aws_creds.aws_region
-                if hasattr(export_aws_creds, "endpoint_url"):
-                    export_extra_args["endpoint_url"] = export_aws_creds.endpoint_url
+                # Iterate through the required fields directly, and copy them to export_extra_args if they exist.
+                credential_fields = {
+                    "aws_access_key_id",
+                    "aws_secret_access_key",
+                    "aws_session_token",
+                    "aws_region",
+                    "endpoint_url",
+                }
+                for field in credential_fields.intersection(export_aws_creds):
+                    export_extra_args[field] = export_aws_creds[field]
 
         self.exporter = RayExporter(
             self.cfg.export_path,
