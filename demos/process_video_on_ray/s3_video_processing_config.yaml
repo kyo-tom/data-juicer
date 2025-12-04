@@ -1,0 +1,105 @@
+# S3 视频处理配置示例
+# 完整工作流：从 S3 下载 -> 处理 -> 上传回 S3
+
+# 全局参数
+project_name: 's3-video-processing-demo'
+executor_type: 'ray'
+ray_address: 'auto'
+
+# 工作目录
+work_dir: './outputs/s3_demo'
+
+# 数据集配置
+dataset:
+  configs:
+    - type: local
+      path: './demos/process_video_on_ray/data/demo-dataset-s3.jsonl'
+
+# 导出配置 - 元数据导出到 S3
+export_path: 's3://jier/dj/dataset/demo-processed'
+export_type: 'jsonl'
+
+# S3 凭证（用于导出元数据）
+export_aws_credentials:
+  aws_access_key_id: 'MfcTKybiGs5Ks7u9N8mU'
+  aws_secret_access_key: 'i3m6G5TikpLqiemlNLcmWeDIgiVGFfvfHGvkehUJ'
+  aws_region: 'us-east-1'
+  endpoint_url: 'http://172.16.124.37:31900'
+
+# 处理流水线
+process:
+  # ============================================
+  # 步骤 1: 从 S3 下载视频到本地
+  # ============================================
+  - s3_download_file_mapper:
+      download_field: 'videos'              # 包含 S3 URL 的字段
+      save_dir: '/tmp/dj_downloaded_videos' # 本地下载目录
+      resume_download: true                 # 跳过已下载的文件
+      timeout: 300                          # HTTP/HTTPS 下载超时（秒）
+      max_concurrent: 5                     # 最大并发下载数
+      # S3 凭证
+      aws_access_key_id: 'MfcTKybiGs5Ks7u9N8mU'
+      aws_secret_access_key: 'i3m6G5TikpLqiemlNLcmWeDIgiVGFfvfHGvkehUJ'
+      aws_region: 'us-east-1'
+      endpoint_url: 'http://172.16.124.37:31900'
+
+  # ============================================
+  # 步骤 2: 视频过滤 - 时长
+  # ============================================
+  - video_duration_filter:
+      min_duration: 20                      # 最小时长（秒）
+      max_duration: 100                     # 最大时长（秒）
+
+  # ============================================
+  # 步骤 3: 视频过滤 - 分辨率
+  # ============================================
+  - video_resolution_filter:
+      min_width: 200                        # 最小宽度（像素）
+      max_width: 4096                       # 最大宽度（像素）
+      min_height: 200                       # 最小高度（像素）
+      max_height: 4096                      # 最大高度（像素）
+      any_or_all: any                       # any 表示满足任一条件即可
+
+  # ============================================
+  # 步骤 4: 按时长分割视频
+  # ============================================
+  - video_split_by_duration_mapper:
+      split_duration: 10                    # 每个片段时长（秒）
+      min_last_split_duration: 0            # 最后一个片段的最小时长
+      keep_original_sample: false           # 不保留原始样本
+      # 处理后的视频保存位置
+      save_dir: '/tmp/dj_processed_videos'
+
+  # ============================================
+  # 步骤 5: 调整视频宽高比
+  # ============================================
+  - video_resize_aspect_ratio_mapper:
+      min_ratio: 1.0                        # 最小宽高比
+      max_ratio: 1.1                        # 最大宽高比
+      strategy: increase                    # 调整策略：增加尺寸
+
+  # ============================================
+  # 步骤 6: 上传处理后的视频到 S3
+  # ============================================
+  - s3_upload_file_mapper:
+      upload_field: 'videos'                # 包含本地文件路径的字段
+      s3_bucket: 'jier'                     # S3 bucket 名称
+      s3_prefix: 'dj/processed_videos/'     # S3 对象前缀（文件夹）
+      remove_local: true                    # 上传后删除本地文件（节省空间）
+      skip_existing: true                   # 跳过 S3 中已存在的文件
+      max_concurrent: 10                    # 最大并发上传数
+      # S3 凭证
+      aws_access_key_id: 'MfcTKybiGs5Ks7u9N8mU'
+      aws_secret_access_key: 'i3m6G5TikpLqiemlNLcmWeDIgiVGFfvfHGvkehUJ'
+      aws_region: 'us-east-1'
+      endpoint_url: 'http://172.16.124.37:31900'
+
+# ============================================
+# 可选：其他配置
+# ============================================
+# 保留统计信息
+keep_stats_in_res_ds: true
+keep_hashes_in_res_ds: false
+
+# 操作符融合（优化性能）
+op_fusion: false
