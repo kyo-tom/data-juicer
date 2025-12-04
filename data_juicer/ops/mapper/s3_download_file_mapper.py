@@ -289,7 +289,7 @@ class S3DownloadFileMapper(Mapper):
 
         return flat_urls, structure_info
 
-    def _create_path_struct(self, nested_urls, keep_failed_url=True) -> str:
+    def _create_path_struct(self, nested_urls, keep_failed_url=True) -> List[Union[str, List[str]]]:
         """Create path structure for output."""
         if keep_failed_url:
             reconstructed = copy.deepcopy(nested_urls)
@@ -303,7 +303,7 @@ class S3DownloadFileMapper(Mapper):
 
         return reconstructed
 
-    def _create_save_field_struct(self, nested_urls, save_field_contents=None) -> str:
+    def _create_save_field_struct(self, nested_urls, save_field_contents=None) -> List[Union[bytes, List[bytes]]]:
         """Create save field structure for output."""
         if save_field_contents is None:
             save_field_contents = []
@@ -330,7 +330,12 @@ class S3DownloadFileMapper(Mapper):
             return_contents = [False] * len(flat_urls)
         else:
             # if original content None, set bool value to True to get content else False to skip reload it
-            return_contents = [not c for sublist in save_field_contents for c in sublist]
+            return_contents = []
+            for item in save_field_contents:
+                if isinstance(item, list):
+                    return_contents.extend([not c for c in item])
+                else:
+                    return_contents.append(not item)
 
         download_results = self.download_files_async(
             flat_urls,
