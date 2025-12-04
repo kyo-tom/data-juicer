@@ -88,24 +88,31 @@ class S3DownloadFileMapper(Mapper):
         self.timeout = timeout
         self.max_concurrent = max_concurrent
 
-        # Initialize S3 client if credentials provided
-        self.s3_client = None
+        # Store S3 configuration (don't create client here to avoid serialization issues)
+        self.s3_config = None
+        self._s3_client = None
         if aws_access_key_id and aws_secret_access_key:
-            s3_config = {
+            self.s3_config = {
                 'aws_access_key_id': aws_access_key_id,
                 'aws_secret_access_key': aws_secret_access_key,
             }
             if aws_session_token:
-                s3_config['aws_session_token'] = aws_session_token
+                self.s3_config['aws_session_token'] = aws_session_token
             if aws_region:
-                s3_config['region_name'] = aws_region
+                self.s3_config['region_name'] = aws_region
             if endpoint_url:
-                s3_config['endpoint_url'] = endpoint_url
-
-            self.s3_client = boto3.client('s3', **s3_config)
-            logger.info(f"S3 client initialized with endpoint: {endpoint_url or 'default'}")
+                self.s3_config['endpoint_url'] = endpoint_url
+            logger.info(f"S3 configuration stored with endpoint: {endpoint_url or 'default'}")
         else:
             logger.info("No S3 credentials provided. S3 URLs will not be supported.")
+
+    @property
+    def s3_client(self):
+        """Lazy initialization of S3 client to avoid serialization issues with Ray."""
+        if self._s3_client is None and self.s3_config is not None:
+            self._s3_client = boto3.client('s3', **self.s3_config)
+            logger.debug("S3 client initialized (lazy)")
+        return self._s3_client
 
     def _is_s3_url(self, url: str) -> bool:
         """Check if the URL is an S3 URL."""

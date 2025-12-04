@@ -81,20 +81,28 @@ class S3UploadFileMapper(Mapper):
         if not (aws_access_key_id and aws_secret_access_key):
             raise ValueError("AWS credentials (aws_access_key_id and aws_secret_access_key) must be provided")
 
-        # Initialize S3 client
-        s3_config = {
+        # Store S3 configuration (don't create client here to avoid serialization issues)
+        self.s3_config = {
             'aws_access_key_id': aws_access_key_id,
             'aws_secret_access_key': aws_secret_access_key,
         }
         if aws_session_token:
-            s3_config['aws_session_token'] = aws_session_token
+            self.s3_config['aws_session_token'] = aws_session_token
         if aws_region:
-            s3_config['region_name'] = aws_region
+            self.s3_config['region_name'] = aws_region
         if endpoint_url:
-            s3_config['endpoint_url'] = endpoint_url
+            self.s3_config['endpoint_url'] = endpoint_url
 
-        self.s3_client = boto3.client('s3', **s3_config)
+        self._s3_client = None
         logger.info(f"S3 upload mapper initialized: bucket={s3_bucket}, prefix={self.s3_prefix}, endpoint={endpoint_url or 'default'}")
+
+    @property
+    def s3_client(self):
+        """Lazy initialization of S3 client to avoid serialization issues with Ray."""
+        if self._s3_client is None:
+            self._s3_client = boto3.client('s3', **self.s3_config)
+            logger.debug("S3 client initialized (lazy)")
+        return self._s3_client
 
     def _is_s3_url(self, path: str) -> bool:
         """Check if the path is already an S3 URL."""
