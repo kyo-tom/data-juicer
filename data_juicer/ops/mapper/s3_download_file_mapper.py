@@ -3,14 +3,11 @@ import copy
 import os
 import os.path as osp
 from typing import List, Union
-from urllib.parse import urlparse
 
-import aiohttp
 import boto3
 from botocore.exceptions import ClientError
 from loguru import logger
 
-from data_juicer.utils.file_utils import download_file, is_remote_path
 from data_juicer.ops.base_op import OPERATORS, Mapper
 
 OP_NAME = "s3_download_file_mapper"
@@ -18,10 +15,9 @@ OP_NAME = "s3_download_file_mapper"
 
 @OPERATORS.register_module(OP_NAME)
 class S3DownloadFileMapper(Mapper):
-    """Mapper to download files from S3/HTTP/HTTPS to local files or load them into memory.
+    """Mapper to download files from S3 to local files or load them into memory.
 
-    This operator extends the standard download_file_mapper with S3 support. It can download
-    files from S3 URLs (s3://...), HTTP/HTTPS URLs, or handle local files. It supports:
+    This operator downloads files from S3 URLs (s3://...) or handles local files. It supports:
     - Downloading multiple files concurrently
     - Saving files to a specified directory or loading content into memory
     - Resume download functionality
@@ -57,7 +53,7 @@ class S3DownloadFileMapper(Mapper):
         :param save_dir: The directory to save downloaded files.
         :param save_field: The field name to save the downloaded file content.
         :param resume_download: Whether to resume download. If True, skip the sample if it exists.
-        :param timeout: Timeout for HTTP/HTTPS download in seconds.
+        :param timeout: (Deprecated) Kept for backward compatibility, not used for S3 downloads.
         :param max_concurrent: Maximum concurrent downloads.
         :param aws_access_key_id: AWS access key ID for S3.
         :param aws_secret_access_key: AWS secret access key for S3.
@@ -185,10 +181,9 @@ class S3DownloadFileMapper(Mapper):
             return 'failed', error_msg, None, None
 
     def download_files_async(self, urls, return_contents, save_dir=None, **kwargs):
-        """Download files asynchronously from S3/HTTP/HTTPS."""
+        """Download files asynchronously from S3."""
 
         async def _download_file(
-            session: aiohttp.ClientSession,
             semaphore: asyncio.Semaphore,
             idx: int,
             url: str,
@@ -223,34 +218,19 @@ class S3DownloadFileMapper(Mapper):
                     )
                     return idx, save_path, status, response, content
 
+                # Check for HTTP/HTTPS URLs - not supported
+                if url.startswith('http://') or url.startswith('https://'):
+                    raise ValueError(f"HTTP/HTTPS URLs are not supported. This mapper only supports S3 URLs (s3://...) and local files. Got: {url}")
+
                 # Handle local files
-                if not is_remote_path(url):
-                    if return_content:
-                        with open(url, "rb") as f:
-                            content = f.read()
-                    if save_dir:
-                        save_path = url
-                    return idx, save_path, status, response, content
-
-                # Skip if nothing to do
-                if not save_dir and not return_content:
-                    return idx, save_path, status, response, content
-
-                # Handle HTTP/HTTPS URLs
+                if return_content:
+                    with open(url, "rb") as f:
+                        content = f.read()
                 if save_dir:
-                    filename = os.path.basename(urlparse(url).path)
-                    save_path = osp.join(save_dir, filename)
+                    save_path = url
 
-                    if os.path.exists(save_path):
-                        if return_content:
-                            with open(save_path, "rb") as f:
-                                content = f.read()
-                        return idx, save_path, status, response, content
+                return idx, save_path, status, response, content
 
-                async with semaphore:
-                    response, content = await download_file(
-                        session, url, save_path, return_content=True, timeout=self.timeout, **kwargs
-                    )
             except Exception as e:
                 status = "failed"
                 response = str(e)
@@ -261,12 +241,11 @@ class S3DownloadFileMapper(Mapper):
 
         async def run_downloads(urls, return_contents, save_dir=None, **kwargs):
             semaphore = asyncio.Semaphore(self.max_concurrent)
-            async with aiohttp.ClientSession() as session:
-                tasks = [
-                    _download_file(session, semaphore, idx, url, save_dir, return_contents[idx], **kwargs)
-                    for idx, url in enumerate(urls)
-                ]
-                return await asyncio.gather(*tasks)
+            tasks = [
+                _download_file(semaphore, idx, url, save_dir, return_contents[idx], **kwargs)
+                for idx, url in enumerate(urls)
+            ]
+            return await asyncio.gather(*tasks)
 
         results = asyncio.run(run_downloads(urls, return_contents, save_dir, **kwargs))
         results.sort(key=lambda x: x[0])
