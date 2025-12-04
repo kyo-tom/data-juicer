@@ -147,6 +147,11 @@ class S3DownloadFileMapper(Mapper):
             bucket, key = self._parse_s3_url(s3_url)
 
             if save_path:
+                # Ensure parent directory exists
+                save_dir = os.path.dirname(save_path)
+                if save_dir:
+                    os.makedirs(save_dir, exist_ok=True)
+
                 # Download to file
                 self.s3_client.download_file(bucket, key, save_path)
                 logger.debug(f"Downloaded S3 file: {s3_url} -> {save_path}")
