@@ -9,6 +9,7 @@ from botocore.exceptions import ClientError
 from loguru import logger
 
 from data_juicer.ops.base_op import OPERATORS, Mapper
+from data_juicer.utils.s3_utils import get_aws_credentials
 
 OP_NAME = "s3_download_file_mapper"
 
@@ -84,18 +85,39 @@ class S3DownloadFileMapper(Mapper):
         self.timeout = timeout
         self.max_concurrent = max_concurrent
 
+        # Prepare config dict for get_aws_credentials
+        ds_config = {}
+        if aws_access_key_id:
+            ds_config["aws_access_key_id"] = aws_access_key_id
+        if aws_secret_access_key:
+            ds_config["aws_secret_access_key"] = aws_secret_access_key
+        if aws_session_token:
+            ds_config["aws_session_token"] = aws_session_token
+        if aws_region:
+            ds_config["aws_region"] = aws_region
+        if endpoint_url:
+            ds_config["endpoint_url"] = endpoint_url
+
+        # Get credentials with priority: environment variables > operator parameters
+        (
+            resolved_access_key_id,
+            resolved_secret_access_key,
+            resolved_session_token,
+            resolved_region,
+        ) = get_aws_credentials(ds_config)
+
         # Store S3 configuration (don't create client here to avoid serialization issues)
         self.s3_config = None
         self._s3_client = None
-        if aws_access_key_id and aws_secret_access_key:
+        if resolved_access_key_id and resolved_secret_access_key:
             self.s3_config = {
-                "aws_access_key_id": aws_access_key_id,
-                "aws_secret_access_key": aws_secret_access_key,
+                "aws_access_key_id": resolved_access_key_id,
+                "aws_secret_access_key": resolved_secret_access_key,
             }
-            if aws_session_token:
-                self.s3_config["aws_session_token"] = aws_session_token
-            if aws_region:
-                self.s3_config["region_name"] = aws_region
+            if resolved_session_token:
+                self.s3_config["aws_session_token"] = resolved_session_token
+            if resolved_region:
+                self.s3_config["region_name"] = resolved_region
             if endpoint_url:
                 self.s3_config["endpoint_url"] = endpoint_url
             logger.info(f"S3 configuration stored with endpoint: {endpoint_url or 'default'}")
@@ -180,7 +202,7 @@ class S3DownloadFileMapper(Mapper):
             logger.error(error_msg)
             return "failed", error_msg, None, None
 
-    def download_files_async(self, urls, return_contents, save_dir=None, **kwargs):
+    async def download_files_async(self, urls, return_contents, save_dir=None, **kwargs):
         """Download files asynchronously from S3."""
 
         async def _download_file(
@@ -191,61 +213,59 @@ class S3DownloadFileMapper(Mapper):
             return_content=False,
             **kwargs,
         ) -> dict:
-            try:
-                status, response, content, save_path = "success", None, None, None
+            async with semaphore:
+                try:
+                    status, response, content, save_path = "success", None, None, None
 
-                # Handle S3 URLs (synchronous operation in async context)
-                if self._is_s3_url(url):
+                    # Handle S3 URLs (synchronous operation in async context)
+                    if self._is_s3_url(url):
+                        if save_dir:
+                            filename = os.path.basename(self._parse_s3_url(url)[1])
+                            save_path = osp.join(save_dir, filename)
+
+                            # Check if file exists and resume is enabled
+                            if os.path.exists(save_path) and self.resume_download:
+                                if return_content:
+                                    with open(save_path, "rb") as f:
+                                        content = f.read()
+                                return idx, save_path, status, response, content
+
+                        # Download from S3 (run in executor to avoid blocking)
+                        loop = asyncio.get_event_loop()
+                        status, response, content, save_path = await loop.run_in_executor(
+                            None, self._download_from_s3, url, save_path, return_content
+                        )
+                        return idx, save_path, status, response, content
+
+                    # Check for HTTP/HTTPS URLs - not supported
+                    if url.startswith("http://") or url.startswith("https://"):
+                        raise ValueError(
+                            f"HTTP/HTTPS URLs are not supported. This mapper only supports S3 URLs (s3://...) and local files. Got: {url}"
+                        )
+
+                    # Handle local files
+                    if return_content:
+                        with open(url, "rb") as f:
+                            content = f.read()
                     if save_dir:
-                        filename = os.path.basename(self._parse_s3_url(url)[1])
-                        save_path = osp.join(save_dir, filename)
+                        save_path = url
 
-                        # Check if file exists and resume is enabled
-                        if os.path.exists(save_path) and self.resume_download:
-                            if return_content:
-                                with open(save_path, "rb") as f:
-                                    content = f.read()
-                            return idx, save_path, status, response, content
-
-                    # Download from S3 (run in executor to avoid blocking)
-                    loop = asyncio.get_event_loop()
-                    status, response, content, save_path = await loop.run_in_executor(
-                        None, self._download_from_s3, url, save_path, return_content
-                    )
                     return idx, save_path, status, response, content
 
-                # Check for HTTP/HTTPS URLs - not supported
-                if url.startswith("http://") or url.startswith("https://"):
-                    raise ValueError(
-                        f"HTTP/HTTPS URLs are not supported. This mapper only supports S3 URLs (s3://...) and local files. Got: {url}"
-                    )
-
-                # Handle local files
-                if return_content:
-                    with open(url, "rb") as f:
-                        content = f.read()
-                if save_dir:
-                    save_path = url
+                except Exception as e:
+                    status = "failed"
+                    response = str(e)
+                    save_path = None
+                    content = None
 
                 return idx, save_path, status, response, content
 
-            except Exception as e:
-                status = "failed"
-                response = str(e)
-                save_path = None
-                content = None
-
-            return idx, save_path, status, response, content
-
-        async def run_downloads(urls, return_contents, save_dir=None, **kwargs):
-            semaphore = asyncio.Semaphore(self.max_concurrent)
-            tasks = [
-                _download_file(semaphore, idx, url, save_dir, return_contents[idx], **kwargs)
-                for idx, url in enumerate(urls)
-            ]
-            return await asyncio.gather(*tasks)
-
-        results = asyncio.run(run_downloads(urls, return_contents, save_dir, **kwargs))
+        semaphore = asyncio.Semaphore(self.max_concurrent)
+        tasks = [
+            _download_file(semaphore, idx, url, save_dir, return_contents[idx], **kwargs)
+            for idx, url in enumerate(urls)
+        ]
+        results = await asyncio.gather(*tasks)
         results.sort(key=lambda x: x[0])
 
         return results
@@ -298,7 +318,9 @@ class S3DownloadFileMapper(Mapper):
 
         return save_field_contents
 
-    def download_nested_urls(self, nested_urls: List[Union[str, List[str]]], save_dir=None, save_field_contents=None):
+    async def download_nested_urls(
+        self, nested_urls: List[Union[str, List[str]]], save_dir=None, save_field_contents=None
+    ):
         """Download nested URLs with structure preservation."""
         flat_urls, structure_info = self._flat_urls(nested_urls)
 
@@ -314,7 +336,7 @@ class S3DownloadFileMapper(Mapper):
                 else:
                     return_contents.append(not item)
 
-        download_results = self.download_files_async(
+        download_results = await self.download_files_async(
             flat_urls,
             return_contents,
             save_dir,
@@ -370,8 +392,10 @@ class S3DownloadFileMapper(Mapper):
         else:
             save_field_contents = None
 
-        save_field_contents, reconstructed_path, failed_info = self.download_nested_urls(
-            batch_nested_urls, save_dir=self.save_dir, save_field_contents=save_field_contents
+        save_field_contents, reconstructed_path, failed_info = asyncio.run(
+            self.download_nested_urls(
+                batch_nested_urls, save_dir=self.save_dir, save_field_contents=save_field_contents
+            )
         )
 
         if self.save_dir:

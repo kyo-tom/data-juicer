@@ -1,5 +1,5 @@
+import asyncio
 import os
-from concurrent.futures import ThreadPoolExecutor
 from typing import List, Union
 
 import boto3
@@ -7,6 +7,7 @@ from botocore.exceptions import ClientError
 from loguru import logger
 
 from data_juicer.ops.base_op import OPERATORS, Mapper
+from data_juicer.utils.s3_utils import get_aws_credentials
 
 OP_NAME = "s3_upload_file_mapper"
 
@@ -75,18 +76,42 @@ class S3UploadFileMapper(Mapper):
         if not self.s3_bucket:
             raise ValueError("s3_bucket must be specified")
 
-        if not (aws_access_key_id and aws_secret_access_key):
-            raise ValueError("AWS credentials (aws_access_key_id and aws_secret_access_key) must be provided")
+        # Prepare config dict for get_aws_credentials
+        ds_config = {}
+        if aws_access_key_id:
+            ds_config["aws_access_key_id"] = aws_access_key_id
+        if aws_secret_access_key:
+            ds_config["aws_secret_access_key"] = aws_secret_access_key
+        if aws_session_token:
+            ds_config["aws_session_token"] = aws_session_token
+        if aws_region:
+            ds_config["aws_region"] = aws_region
+        if endpoint_url:
+            ds_config["endpoint_url"] = endpoint_url
+
+        # Get credentials with priority: environment variables > operator parameters
+        (
+            resolved_access_key_id,
+            resolved_secret_access_key,
+            resolved_session_token,
+            resolved_region,
+        ) = get_aws_credentials(ds_config)
+
+        if not (resolved_access_key_id and resolved_secret_access_key):
+            raise ValueError(
+                "AWS credentials (aws_access_key_id and aws_secret_access_key) must be provided "
+                "either through operator parameters or environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)"
+            )
 
         # Store S3 configuration (don't create client here to avoid serialization issues)
         self.s3_config = {
-            "aws_access_key_id": aws_access_key_id,
-            "aws_secret_access_key": aws_secret_access_key,
+            "aws_access_key_id": resolved_access_key_id,
+            "aws_secret_access_key": resolved_secret_access_key,
         }
-        if aws_session_token:
-            self.s3_config["aws_session_token"] = aws_session_token
-        if aws_region:
-            self.s3_config["region_name"] = aws_region
+        if resolved_session_token:
+            self.s3_config["aws_session_token"] = resolved_session_token
+        if resolved_region:
+            self.s3_config["region_name"] = resolved_region
         if endpoint_url:
             self.s3_config["endpoint_url"] = endpoint_url
 
@@ -175,29 +200,31 @@ class S3UploadFileMapper(Mapper):
             logger.error(error_msg)
             return "failed", local_path, error_msg
 
-    def upload_files_concurrent(self, paths: List[str]) -> List[tuple]:
-        """Upload multiple files concurrently.
+    async def upload_files_async(self, paths: List[str]) -> List[tuple]:
+        """Upload multiple files asynchronously.
 
         :param paths: List of local file paths
         :return: List of (idx, status, s3_url, error_message) tuples
         """
-        results = []
 
-        with ThreadPoolExecutor(max_workers=self.max_concurrent) as executor:
-            futures = {executor.submit(self._upload_to_s3, path): idx for idx, path in enumerate(paths)}
-
-            for future in futures:
-                idx = futures[future]
+        async def _upload_file(semaphore: asyncio.Semaphore, idx: int, path: str) -> tuple:
+            async with semaphore:
                 try:
-                    status, s3_url, error = future.result()
-                    results.append((idx, status, s3_url, error))
+                    # Upload to S3 (run in executor to avoid blocking)
+                    loop = asyncio.get_event_loop()
+                    status, s3_url, error = await loop.run_in_executor(None, self._upload_to_s3, path)
+                    return idx, status, s3_url, error
                 except Exception as e:
-                    error_msg = f"Upload thread error: {e}"
+                    error_msg = f"Upload error: {e}"
                     logger.error(error_msg)
-                    results.append((idx, "failed", paths[idx], error_msg))
+                    return idx, "failed", path, error_msg
 
-        # Sort by index to maintain order
+        semaphore = asyncio.Semaphore(self.max_concurrent)
+        tasks = [_upload_file(semaphore, idx, path) for idx, path in enumerate(paths)]
+        results = await asyncio.gather(*tasks)
+        results = list(results)
         results.sort(key=lambda x: x[0])
+
         return results
 
     def _flat_paths(self, nested_paths):
@@ -226,7 +253,7 @@ class S3UploadFileMapper(Mapper):
                 reconstructed.append(None)
         return reconstructed
 
-    def upload_nested_paths(self, nested_paths: List[Union[str, List[str]]]):
+    async def upload_nested_paths(self, nested_paths: List[Union[str, List[str]]]):
         """Upload nested paths with structure preservation.
 
         :param nested_paths: Nested list of file paths
@@ -234,8 +261,8 @@ class S3UploadFileMapper(Mapper):
         """
         flat_paths, structure_info = self._flat_paths(nested_paths)
 
-        # Upload all files concurrently
-        upload_results = self.upload_files_concurrent(flat_paths)
+        # Upload all files asynchronously
+        upload_results = await self.upload_files_async(flat_paths)
 
         # Reconstruct nested structure
         reconstructed_paths = self._create_path_struct(nested_paths)
@@ -282,7 +309,7 @@ class S3UploadFileMapper(Mapper):
         batch_nested_paths = samples[self.upload_field]
 
         # Upload files and get S3 URLs
-        reconstructed_paths, failed_info = self.upload_nested_paths(batch_nested_paths)
+        reconstructed_paths, failed_info = asyncio.run(self.upload_nested_paths(batch_nested_paths))
 
         # Update the field with S3 URLs
         samples[self.upload_field] = reconstructed_paths
